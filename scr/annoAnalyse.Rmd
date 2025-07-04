@@ -1,0 +1,516 @@
+---
+title: "CultTechContactsNerAnalysis"
+author: "Celis Tittse"
+date: "2025-06-12"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(knitr)
+library(readxl)
+library(kableExtra)
+library(lme4)
+library(modelsummary)
+library(sjPlot)
+library(writexl)
+library(gt)
+library(stringr)
+library(gtsummary)
+
+```
+
+## Import data 
+Aggregated data from auto ner and 
+```{r data}
+rm(list=ls())
+gtWebNerAgr <- read_excel("/Users/celistittse/Documents/CultTech/Data/result_data/gtWebNerAgr.xlsx")
+webNerAgr <- read_excel("/Users/celistittse/Documents/CultTech/Data/result_data/WebNerAgr.xlsx")
+
+gtContacts <- read_excel("/Users/celistittse/Documents/CultTech/Data/raw_data/gt_contacts.xlsx")
+
+
+gtWebNerAgr <- gtWebNerAgr %>% 
+  filter(wrong_identified == 0) %>% 
+  mutate(known = ifelse(self == 1, 0, known),
+         min_dist_cato = ifelse(min_distance == -1, NaN, 
+                                ifelse(min_distance > 24, '25+', 
+                                ifelse(min_distance > 5, '6-24', 
+                                       ifelse(min_distance > 2, "3-5",
+                                          as.character(min_distance)
+                                       )))),
+         count_cato = ifelse(count > 5, "6+", as.character(count))) %>% 
+  filter(min_dist_cato != "NaN") %>% 
+  rename(id = `...1`)
+
+webNerAgr <- webNerAgr %>% 
+  mutate(min_dist_cato = ifelse(min_distance == -1, NaN, 
+                          ifelse(min_distance > 24, '25+', 
+                          ifelse(min_distance > 5, '6-24', 
+                                 ifelse(min_distance > 2, "3-5",
+                                    as.character(min_distance)
+                                       )))),
+         count_cato = ifelse(count > 5, "6+", as.character(count))) %>% 
+  filter(min_dist_cato != "NaN") %>% 
+  rename(id = `...1`)
+
+
+  
+```
+
+```{r EDA background}
+gtContacts %>% 
+  clean_names() %>% 
+  select(native_language, ethnicity, 
+         age, sector, gender, high_education) %>% 
+  mutate(gender = factor(gender, labels = c("Male", "Female")),
+         high_education = factor(high_education, labels = c("High")),
+         sector = str_to_sentence(sector)) %>%
+  tbl_summary(by = gender,
+              statistic = list(all_continuous() ~ "{mean} ({sd})",
+                               all_categorical() ~ "{n} ({p}%)"),
+              label = list(
+                native_language ~ "Native Language",
+                age ~ "Age (years)",
+                ethnicity ~ "Ethnicity (1 = minority)",
+                high_education ~ "High Education",
+                sector ~ "Sector")) %>%
+  add_n() %>%
+  add_overall() %>%
+  bold_labels()
+
+
+```
+
+
+```{r EDA ground truth, echo=F}
+# Create summary table
+eda_table <- gtWebNerAgr %>%
+  summarise(
+    `Total Observations` = n(),
+    `Proportion Known` = mean(known),
+    `Same Family Name (%)` = mean(family) * 100,
+    `Unique Sources` = n_distinct(source_name)
+  ) %>%
+  pivot_longer(cols = everything(), names_to = "Variable", values_to = "Value") %>%
+  gt() %>%
+  tab_header(
+    title = md("**Descriptive Statistics: gtWebNerAgr**"),
+    subtitle = "Summary of key variables used in the model"
+  ) %>%
+  fmt_number(columns = "Value", decimals = 2) %>%
+  cols_label(Variable = "Variable", Value = "Value")
+
+eda_table
+
+# Create tidy count summaries of factor variables
+factor_summary <- bind_rows(
+  as.data.frame(table(gtWebNerAgr$self_auto)) %>% mutate(Variable = "Name Match"),
+  as.data.frame(table(gtWebNerAgr$count_cato)) %>% mutate(Variable = "Co-occurrence Count"),
+  as.data.frame(table(gtWebNerAgr$type)) %>% mutate(Variable = "Search Name Type"),
+  as.data.frame(table(gtWebNerAgr$min_dist_cato)) %>% mutate(Variable = "Sentence Distance"),
+  as.data.frame(table(gtWebNerAgr$lang_match)) %>% mutate(Variable = "Language Match")
+) %>%
+  rename(Level = Var1, Count = Freq) %>%
+  group_by(Variable) %>%
+  mutate(Percent = round(Count / sum(Count) * 100, 1)) %>%
+  ungroup() %>%
+  select(Variable, Level, Count, Percent)
+
+# Render as HTML with gt
+factor_summary %>%
+  gt() %>%
+  tab_header(
+    title = md("**Factor Breakdown: gtWebNerAgr**"),
+    subtitle = "Distributions of categorical predictors"
+  ) %>%
+  fmt_number(columns = "Percent", decimals = 1) %>%
+  cols_label(
+    Variable = "Variable",
+    Level = "Level",
+    Count = "Count",
+    Percent = "Percent (%)"
+  )
+
+```
+
+
+```{r big regression, echo=FALSE}
+gtWebNerAgr$count_cato <- factor(gtWebNerAgr$count_cato, levels=c("6+", "1", "2", "3", "4", "5"))
+gtWebNerAgr$lang_match <- factor(gtWebNerAgr$lang_match, levels=c("native", "english", "not native"))
+gtWebNerAgr$min_dist_cato <- factor(gtWebNerAgr$min_dist_cato, 
+                                    levels=c("0", "1", "2", "3-5", "6-24", "25+"))
+
+model <- glmer(known ~ factor(self_auto) + factor(family) + 
+                 count_cato + type + factor(min_dist_cato) + 
+                 lang_match + (1 | source_name),
+               data = gtWebNerAgr, family = binomial,
+               control = glmerControl(optimizer ="Nelder_Mead"))
+
+summary(model)
+
+manual_labels = c("Intercept", 
+                  "Same First Last Name",
+                  "Same Last Name",
+                  "Co-occurrence Count = 1",
+                  "Co-occurrence Count = 2",
+                  "Co-occurrence Count = 3",
+                  "Co-occurrence Count = 4",
+                  "Co-occurrence Count = 5",
+                  "Search Name without Affiliation",
+                  "Sentence Distance = 1",
+                  "Sentence Distance = 2",
+                  "Sentence Distance = 3–5",
+                  "Sentence Distance = 6–24",
+                  "Sentence Distance = 25+", 
+                  "Webpage = English",
+                  "Webpage = Not Native Language")
+
+tab_model(model,
+          transform = "exp",  # Odds Ratios
+          show.re.var = TRUE,
+          title = "Multilevel Logistic Regression: Predicting Known Contact",
+          dv.labels = "Known Contacts",
+          pred.labels = manual_labels)
+
+```
+
+
+```{r self auto}
+# Compute counts
+count_data <- gtWebNerAgr %>%
+  count(self_auto, known) %>%
+  group_by(known) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+chi_result <- chisq.test(table(gtWebNerAgr$self_auto, gtWebNerAgr$known))
+
+# Extract key values
+chi_stat <- round(chi_result$statistic, 2)
+df <- chi_result$parameter
+p_val <- chi_result$p.value
+p_label <- ifelse(p_val < 0.001, "< 0.001", paste0("= ", round(p_val, 3)))
+
+# Plot
+ggplot(count_data, aes(x = factor(self_auto), y = factor(known))) +
+  geom_tile(aes(fill = n), color = "white") +
+  geom_text(aes(label = paste0(n, ' (', round(percentage, 1), '%)')), # frequency (percentage known)
+            size = 5) +
+  scale_fill_gradient(low = "white", high = "darkgrey", name = "Count") +
+  labs(
+    x = "Same First and Last Name",
+    y = "Known Contact",
+    title = "Effect of Full Name Similarity on Contact Recognition",
+    subtitle = paste0(
+    "Cell values: count and row-wise % | Chi²(", df, 
+    ") = ", chi_stat, ", p ", p_label),
+    fill = "Contact Count"
+  ) +
+  theme_minimal()
+```
+
+```{r family}
+# Compute counts
+count_data <- gtWebNerAgr %>%
+  count(family, known) %>%
+  group_by(known) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+chi_result <- chisq.test(table(gtWebNerAgr$family, gtWebNerAgr$known))
+
+# Extract key values
+chi_stat <- round(chi_result$statistic, 2)
+df <- chi_result$parameter
+p_val <- chi_result$p.value
+p_label <- ifelse(p_val < 0.001, "< 0.001", paste0("= ", round(p_val, 3)))
+
+# Plot
+ggplot(count_data, aes(x = factor(family), y = factor(known))) +
+  geom_tile(aes(fill = n), color = "white") +
+  geom_text(aes(label = paste0(n, ' (', round(percentage, 1), '%)')), # frequency (percentage known)
+            size = 5) +
+  scale_fill_gradient(low = "white", high = "darkgrey", name = "Count") +
+  labs(
+    x = "Same First and Last Name",
+    y = "Known Contact",
+    title = "Effect of Full Name Similarity on Contact Recognition",
+    subtitle = paste0(
+    "Cell values: count and row-wise % | Chi²(", df, 
+    ") = ", chi_stat, ", p ", p_label),
+    fill = "Contact Count"
+  ) +
+  theme_minimal()
+```
+
+```{r direct or indirect}
+# Compute counts
+count_data <- gtWebNerAgr %>%
+  mutate(type = ifelse(type == "direct", 'Name, Affiliation', 'Name')) %>% 
+  count(type, known) %>%
+  group_by(known) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+chi_result <- chisq.test(table(gtWebNerAgr$type, gtWebNerAgr$known))
+
+# Extract key values
+chi_stat <- round(chi_result$statistic, 2)
+df <- chi_result$parameter
+p_val <- chi_result$p.value
+p_label <- ifelse(p_val < 0.001, "< 0.001", paste0("= ", round(p_val, 3)))
+
+# Plot
+ggplot(count_data, aes(x = factor(type), y = factor(known))) +
+  geom_tile(aes(fill = n), color = "white") +
+  geom_text(aes(label = paste0(n, ' (', round(percentage, 1), '%)')),  # frequency (percentage known)
+            size = 5) +
+  scale_fill_gradient(low = "white", high = "darkgrey", name = "Count") +
+  labs(
+    x = "Name, and Name, Affiliation",
+    y = "Known Contact",
+    title = "Effect of Search on Name and Affiliation on Contact Recognition",
+    subtitle = paste0(
+    "Cell values: count and row-wise % | Chi²(", df, 
+    ") = ", chi_stat, ", p ", p_label),
+    fill = "Contact Count"
+  ) +
+  theme_minimal()
+
+
+
+```
+```{r language similarity}
+# Compute counts
+count_data <- gtWebNerAgr %>%
+  mutate(lang_match = factor(lang_match, levels = c("native", "english", "not native"))) %>%
+  count(lang_match, known) %>%
+  group_by(known) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+# Chi-squared test
+chi_result <- chisq.test(table(gtWebNerAgr$lang_match, gtWebNerAgr$known))
+
+# Extract key values
+chi_stat <- round(chi_result$statistic, 2)
+df <- chi_result$parameter
+p_val <- chi_result$p.value
+p_label <- ifelse(p_val < 0.001, "< 0.001", paste0("= ", round(p_val, 3)))
+
+# Plot
+ggplot(count_data, aes(x = lang_match, y = factor(known))) +
+  geom_tile(aes(fill = n), color = "white") +
+  geom_text(aes(label = paste0(n, ' (', round(percentage, 1), '%)')), size = 5) +
+  scale_fill_gradient(low = "white", high = "darkgrey", name = "Count") +
+  labs(
+    x = "Language Similarity",
+    y = "Known Contact",
+    title = "Effect of Website and Source Name Native Language Similarity on Contact Recognition",
+    subtitle = paste0("Cell values: count and row-wise % | Chi²(", df, ") = ", chi_stat, ", p ", p_label),
+    fill = "Contact Count"
+  ) +
+  theme_minimal()
+
+
+
+```
+
+
+```{r min distant}
+ggplot(
+  gtWebNerAgr %>%
+    mutate(min_distance = ifelse(min_distance > 30, 30, min_distance)),
+  aes(x = min_distance, fill = factor(known))
+) +
+  geom_histogram(position = "dodge", binwidth = 1, colour = "white") +
+  scale_fill_manual(
+    values = c("0" = "#D55E00", "1" = "#0072B2"),
+    name = "Known Contact",
+    labels = c("No", "Yes")
+  ) +
+  labs(
+    x = "Minimum Sentence Distance (Capped at 30)",
+    y = "Frequency",
+    title = "Distribution of Sentence Distance",
+    subtitle = "Grouped by Whether the Target Was a Known Contact"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(margin = margin(b = 10))
+  ) +
+  ylim(0, 250)
+
+# Compute counts and percentages
+count_data <- gtWebNerAgr %>%
+  count(min_dist_cato, known) %>% 
+  drop_na() %>% 
+  group_by(known) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+# Chi-squared test
+tab <- table(gtWebNerAgr$min_dist_cato, gtWebNerAgr$known)
+chi_result <- chisq.test(tab)
+
+# Extract Chi² summary
+chi_stat <- round(chi_result$statistic, 2)
+df <- chi_result$parameter
+p_val <- chi_result$p.value
+p_label <- ifelse(p_val < 0.001, "< 0.001", paste0("= ", round(p_val, 3)))
+
+# Prepare expected values as data frame
+expected_df <- as.data.frame(as.table(chi_result$expected)) %>%
+  rename(min_dist_cato = Var1, known = Var2, expected = Freq)
+
+# Merge expected values with count_data
+plot_data <- count_data %>%
+  mutate(min_dist_cato = as.character(min_dist_cato),
+         known = as.character(known)) %>%
+  left_join(expected_df, by = c("min_dist_cato", "known"))
+
+# Plot counts, percentages, and expected values
+ggplot(plot_data, aes(x = factor(min_dist_cato), y = factor(known))) +
+  geom_tile(aes(fill = n), color = "white") +
+  geom_text(aes(label = paste0(
+    n, "\n(Exp: ", round(expected, 1), ")"
+  )), size = 4) +
+  scale_fill_gradient(low = "white", high = "darkgrey", name = "Count") +
+  labs(
+    x = "Sentence Distance",
+    y = "Known Contact",
+    title = "Effect of Sentence Distance on Contact Recognition",
+    subtitle = paste0(
+      "Cell values: count, expected count | Chi²(", df, 
+      ") = ", chi_stat, ", p ", p_label
+    )
+  ) +
+  theme_minimal()
+
+```
+
+```{r count}
+ggplot(
+  gtWebNerAgr %>% mutate(count = ifelse(count > 10, 10, count)),
+  aes(x = count, fill = factor(known))
+) +
+  geom_histogram(position = "dodge", binwidth = 1, colour = "white") +
+  scale_fill_manual(
+    values = c("0" = "#D55E00", "1" = "#0072B2"),
+    name = "Known Contact",
+    labels = c("No", "Yes")
+  ) +
+  labs(
+    x = "Co-occurrence Count (Capped at 10)",
+    y = "Frequency",
+    title = "Distribution of Co-occurrence Counts",
+    subtitle = "Grouped by Whether the Target Was a Known Contact"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position = "top",
+    plot.title = element_text(face = "bold"),
+    plot.subtitle = element_text(margin = margin(b = 10))
+  )
+
+gtWebNerAgr %>% 
+  filter(count < 20) %>% 
+  select(known, count) %>% 
+  table()
+
+gtWebNerAgr <- gtWebNerAgr %>% 
+  mutate(count_cato = ifelse(count > 10, "7+", as.character(count)))
+
+
+# Compute counts and percentages
+count_data <- gtWebNerAgr %>%
+  count(count_cato, known) %>% 
+  drop_na() %>% 
+  group_by(known) %>%
+  mutate(percentage = n / sum(n) * 100) %>%
+  ungroup()
+
+# Chi-squared test
+tab <- table(gtWebNerAgr$count_cato, gtWebNerAgr$known)
+chi_result <- chisq.test(tab)
+chi_result
+
+# Extract Chi² summary
+chi_stat <- round(chi_result$statistic, 2)
+df <- chi_result$parameter
+p_val <- chi_result$p.value
+p_label <- ifelse(p_val < 0.001, "< 0.001", paste0("= ", round(p_val, 3)))
+
+# Prepare expected values as data frame
+expected_df <- as.data.frame(as.table(chi_result$expected)) %>%
+  rename(count_cato = Var1, known = Var2, expected = Freq)
+
+# Merge expected values with count_data
+plot_data <- count_data %>%
+  mutate(count_cato = as.character(count_cato),
+         known = as.character(known)) %>%
+  left_join(expected_df, by = c("count_cato", "known"))
+
+# Plot counts, percentages, and expected values
+ggplot(plot_data, aes(x = factor(count_cato), y = factor(known))) +
+  geom_tile(aes(fill = n), color = "white") +
+  geom_text(aes(label = paste(
+    n, '\n', round(expected, 0))
+    ), 
+    size = 4) +
+  scale_fill_gradient(low = "white", high = "darkgrey", name = "Count") +
+  labs(
+    x = "Co-occurence",
+    y = "Known Contact",
+    title = "Effect of Sentence Distance on Contact Recognition",
+    subtitle = paste0(
+      "Cell values: count, expected count | Chi²(", df, 
+      ") = ", chi_stat, ", p ", p_label
+    )
+  ) +
+  theme_minimal()
+```
+
+```{r filtered targets}
+filtered_df <- webNerAgr %>% 
+  select(!id) %>% 
+  distinct() %>% 
+  filter(family == 0,
+         type=='direct',
+         count > 2,
+         min_distance < 2,
+         lang_match == 'native',
+        !grepl("deezer", url))
+
+filtered_df %>% 
+  select(known) %>% 
+  table()
+
+webNerAgr %>% 
+  drop_na(known) %>% 
+  distinct(target_name) %>% 
+  summarise(rows = n())
+
+missed_names <- webNerAgr %>% 
+  filter(
+         !(target_name %in% filtered_df$target_name)) %>% 
+  select(!id) %>% 
+  distinct()
+
+missed_names %>% 
+  select(known) %>% 
+  table()
+
+missed_names %>% 
+  distinct(target_name) %>% 
+  summarise(rows = n())
+
+# 
+# write_xlsx(missed_names,
+#            "/Users/celistittse/Documents/CultTech/Data/result_data/MissedFilteredNames.xlsx")
+
+```
